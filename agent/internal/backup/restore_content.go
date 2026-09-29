@@ -145,6 +145,11 @@ func (c *contentRestorer) run(ctx context.Context) (cancelled bool) {
 		// Admit entries in manifest order while the window, the worker bound
 		// and the staged-bytes budget allow.
 		for next < n && next-head < window && inflight < workers {
+			if ctx != nil && ctx.Err() != nil {
+				// Cancelled: start nothing new. What is in flight drains
+				// below, and nothing past this point is ever installed.
+				break
+			}
 			file := c.files[next]
 			stagingFile := filepath.Join(c.stagingDir, stagingFileName(file.BackupPath))
 			if inWindow[stagingFile] > 0 {
@@ -324,6 +329,8 @@ func (c *contentRestorer) fail(displayPath string) {
 func (c *contentRestorer) fetchAndVerify(s contentSlot) contentFetchOutcome {
 	file := s.file
 	if err := c.provider.Download(file.BackupPath, s.stagingFile); err != nil {
+		// A provider may leave a partial object behind on a mid-body error.
+		_ = os.Remove(s.stagingFile)
 		slog.Warn("failed to download file", "backupPath", file.BackupPath, "error", err.Error())
 		return contentFetchOutcome{failed: true}
 	}
