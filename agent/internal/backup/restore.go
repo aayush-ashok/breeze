@@ -187,157 +187,25 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 		progressFn("starting", 0, total, fmt.Sprintf("restoring %d files", total))
 	}
 
-	// 5. Restore each file
-	for i, file := range files {
-		if checkCancelled() {
-			return result, nil
-		}
-
-		current := int64(i + 1)
-		displayPath := restoreSourcePath(file)
-		relativeTarget, relErr := restoreRelativePath(displayPath)
-		if relErr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("invalid restore path %s: %v", displayPath, relErr))
-			result.FilesFailed++
-			result.FailedFiles = append(result.FailedFiles, displayPath)
-			continue
-		}
-		targetPath := filepath.Join(targetBase, relativeTarget)
-
-		// Skip already-completed files (resume)
-		if resume.completed(file.BackupPath) {
-			if info, statErr := securefs.StatFile(targetBase, relativeTarget); statErr == nil && info.Size() == file.Size {
-				result.FilesRestored++
-				result.BytesRestored += file.Size
-				if progressFn != nil {
-					progressFn("restoring", current, total,
-						fmt.Sprintf("skipped (resumed): %s", displayPath))
-				}
-				continue
-			}
-			resume.forget(file.BackupPath)
-		}
-
-		// Download to staging
-		stagingFile := filepath.Join(stagingDir, stagingFileName(file.BackupPath))
-		dlErr := provider.Download(file.BackupPath, stagingFile)
-		if dlErr != nil {
-			result.FilesFailed++
-			result.FailedFiles = append(result.FailedFiles, displayPath)
-			slog.Warn("failed to download file",
-				"backupPath", file.BackupPath, "error", dlErr.Error())
-			continue
-		}
-		if checkCancelled() {
-			_ = os.Remove(stagingFile)
-			return result, nil
-		}
-
-		// No pathname containment check, MkdirAll or moveFile here: the
-		// publication below walks the target hierarchy with directory
-		// descriptors/handles and refuses a symlink or reparse point at every
-		// component. That subsumes both the lexical containment check and
-		// EnsureNoSymlinkAncestor (which only lstat's, and so is decided
-		// before the write rather than during it), including the RESUMED case
-		// where an earlier pass recreated an ancestor as a symlink.
-		// Verify the restored bytes against the manifest BEFORE declaring the
-		// file restored. This is the path that writes real user data, so a
-		// corrupt/truncated object must not be silently reported "restored"
-		// (VerifyIntegrity/TestRestore run this same fail-closed check, but only
-		// against throwaway dirs — the real restore needs it too). Size is
-		// always checked; the SHA-256 when the manifest carries one.
-		if info, statErr := os.Stat(stagingFile); statErr != nil || info == nil {
-			result.FilesFailed++
-			result.FailedFiles = append(result.FailedFiles, displayPath)
-			_ = os.Remove(stagingFile)
-			slog.Warn("failed to stat restored file", "target", targetPath, "error", fmt.Sprint(statErr))
-			continue
-		} else if info.Size() != file.Size {
-			if file.Volatile {
-				// The source kept changing while it was being backed up
-				// (#5581) — the manifest's Size/Checksum describe the last
-				// pre-upload measurement, not necessarily what a fresh
-				// read of the (still-live) object would show. A mismatch
-				// here is expected, not corruption: warn and restore the
-				// bytes anyway rather than failing the file.
-				result.Warnings = append(result.Warnings,
-					fmt.Sprintf("restored %s: size differs from manifest (manifest %d, restored %d) — file was volatile during backup", displayPath, file.Size, info.Size()))
-				slog.Warn("restored volatile file has a size mismatch (advisory, not a failure)",
-					"target", targetPath, "manifestSize", file.Size, "restoredSize", info.Size())
-			} else {
-				result.FilesFailed++
-				result.FailedFiles = append(result.FailedFiles, displayPath)
-				_ = os.Remove(stagingFile)
-				result.Warnings = append(result.Warnings,
-					fmt.Sprintf("restored %s failed size check: manifest %d, restored %d", displayPath, file.Size, info.Size()))
-				slog.Warn("restored file failed size check",
-					"target", targetPath, "manifestSize", file.Size, "restoredSize", info.Size())
-				continue
-			}
-		}
-		if file.Checksum != "" && !checksumMatches(stagingFile, file.Checksum) {
-			if file.Volatile {
-				result.Warnings = append(result.Warnings,
-					fmt.Sprintf("restored %s: checksum differs from manifest (manifest %s) — file was volatile during backup", displayPath, file.Checksum))
-				slog.Warn("restored volatile file has a checksum mismatch (advisory, not a failure)", "target", targetPath)
-			} else {
-				result.FilesFailed++
-				result.FailedFiles = append(result.FailedFiles, displayPath)
-				_ = os.Remove(stagingFile)
-				result.Warnings = append(result.Warnings,
-					fmt.Sprintf("restored %s failed checksum check (manifest %s)", displayPath, file.Checksum))
-				slog.Warn("restored file failed checksum check", "target", targetPath)
-				continue
-			}
-		}
-
-		// Publish only verified bytes. Linux, macOS and Windows pin the
-		// target hierarchy with directory descriptors/handles and never follow
-		// a destination symlink/reparse point. Mode (full ModeBits when the
-		// manifest carries them, else the perm-only Mode), owner, mtime,
-		// Windows attributes and the captured NTFS security descriptor (W06a)
-		// are all applied to the pinned temporary's handle BEFORE the atomic
-		// replace, so #5520's fidelity is preserved without any
-		// post-publication pathname chmod/chown/chtimes/SetSecurity — the
-		// exact operations this boundary (SEC-121) exists to remove.
-		mode := os.FileMode(file.Mode).Perm()
-		if file.ModeBits != 0 {
-			mode = os.FileMode(file.ModeBits)
-		}
-		var secApplier *securefs.SecurityApplier
-		if sd := secDescs.forEntry(file); sd != nil {
-			var secErr error
-			if secApplier, secErr = restoreSecurityApplier(sd); secErr != nil {
-				// An invalid descriptor is a fidelity warning; the content
-				// still installs (R39).
-				result.Warnings = append(result.Warnings, fmt.Sprintf("restored %s with reduced fidelity: could not reapply security descriptor: %v", displayPath, secErr))
-			}
-		}
-		installWarnings, err := securefs.InstallFileWithSecurity(targetBase, relativeTarget, stagingFile, mode, file.ModTime, entryOwner(file, applyOwnership), file.WinAttrs, secApplier)
-		if err != nil {
-			result.FilesFailed++
-			result.FailedFiles = append(result.FailedFiles, displayPath)
-			result.Warnings = append(result.Warnings, fmt.Sprintf("could not restore %s: %v", displayPath, err))
-			_ = os.Remove(stagingFile)
-			slog.Warn("failed to install restored file", "target", targetPath, "error", err.Error())
-			continue
-		}
-		for _, warning := range installWarnings {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("restored %s with reduced fidelity: %v", displayPath, warning))
-		}
-		if !applyOwnership && (file.Owner != nil || file.ModeBits&uint32(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0) {
-			warnOwnership()
-		}
-
-		result.FilesRestored++
-		result.BytesRestored += file.Size
-		// One journal append per file — not a rewrite of the whole state.
-		resume.markCompleted(file.BackupPath, file.Size)
-
-		if progressFn != nil {
-			progressFn("restoring", current, total,
-				fmt.Sprintf("restored: %s", displayPath))
-		}
+	// 5. Restore each file: downloads and verification run concurrently;
+	// install, resume journaling, counters and progress stay in manifest
+	// order on this goroutine (restore_content.go, #5623).
+	content := &contentRestorer{
+		provider:       provider,
+		files:          files,
+		targetBase:     targetBase,
+		stagingDir:     stagingDir,
+		total:          total,
+		result:         result,
+		resume:         resume,
+		secDescs:       secDescs,
+		applyOwnership: applyOwnership,
+		warnOwnership:  warnOwnership,
+		progressFn:     progressFn,
+		checkCancelled: checkCancelled,
+	}
+	if content.run(ctx) {
+		return result, nil
 	}
 
 	// Pass 2: symlinks (parents exist now, from the file pass above). Pass
